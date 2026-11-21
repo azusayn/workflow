@@ -16,7 +16,7 @@ type WorkflowModel struct {
 	NodeConfigs map[string]*NodeConfig
 }
 
-type workflowRunModel struct {
+type WorkflowRunModel struct {
 	ID         string
 	WorkflowID string
 	Data       json.RawMessage
@@ -25,6 +25,7 @@ type workflowRunModel struct {
 	CompletedNodes int
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	TraceCarrier   map[string]string
 }
 
 type NodeExecution struct {
@@ -64,9 +65,9 @@ type WorkflowStore interface {
 	GetOrCreateWorkflow(ctx context.Context, name string, nodeConfigs map[string]*NodeConfig) (*WorkflowModel, error)
 	ListWorkflows(ctx context.Context, ids []string) ([]*WorkflowModel, error)
 
-	GetWorkflowRun(ctx context.Context, workflowRunID string) (*workflowRunModel, error)
-	ListPendingWorkflowRuns(ctx context.Context) ([]*workflowRunModel, error)
-	CreateWorkflowRun(ctx context.Context, workflowRun *workflowRunModel) (string, error)
+	GetWorkflowRun(ctx context.Context, workflowRunID string) (*WorkflowRunModel, error)
+	ListPendingWorkflowRuns(ctx context.Context) ([]*WorkflowRunModel, error)
+	CreateWorkflowRun(ctx context.Context, workflowRun *WorkflowRunModel) (string, error)
 	UpdateWorkflowRun(ctx context.Context, input UpdateWorkflowRunInput) error
 }
 
@@ -110,15 +111,15 @@ func (s *noopStore) ListWorkflows(context.Context, []string) ([]*WorkflowModel, 
 	return nil, nil
 }
 
-func (s *noopStore) GetWorkflowRun(context.Context, string) (*workflowRunModel, error) {
+func (s *noopStore) GetWorkflowRun(context.Context, string) (*WorkflowRunModel, error) {
 	return nil, errors.New("unimplemented")
 }
 
-func (s *noopStore) ListPendingWorkflowRuns(context.Context) ([]*workflowRunModel, error) {
+func (s *noopStore) ListPendingWorkflowRuns(context.Context) ([]*WorkflowRunModel, error) {
 	return nil, nil
 }
 
-func (s *noopStore) CreateWorkflowRun(_ context.Context, _ *workflowRunModel) (string, error) {
+func (s *noopStore) CreateWorkflowRun(_ context.Context, _ *WorkflowRunModel) (string, error) {
 	return uuid.NewString(), nil
 }
 

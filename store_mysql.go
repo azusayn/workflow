@@ -40,6 +40,7 @@ func (s *MySQLStore) Schema() []string {
     workflow_id VARCHAR(64) NOT NULL,
     data TEXT NOT NULL,
     completed_nodes INT NOT NULL DEFAULT 0,
+    trace_carrier TEXT NOT NULL,
     created_at DATETIME(3) NOT NULL,
     updated_at DATETIME(3) NOT NULL,
     KEY idx_workflow_runs_pending (workflow_id, completed_nodes)
@@ -110,7 +111,7 @@ SELECT subscriber_id, event_ids FROM subscriber_events
 	if err != nil {
 		return nil, fmt.Errorf("load subscriber map failed: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
 	out := make(map[string]map[string]struct{})
 	for rows.Next() {
@@ -163,7 +164,7 @@ SELECT subscriber_id, condition_id, event_id, payload FROM workflow_conditions
 	if err != nil {
 		return nil, fmt.Errorf("load conditions failed: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
 	out := make(map[string]ConditionModel)
 	for rows.Next() {
@@ -297,7 +298,7 @@ WHERE id IN (`+placeholders+`)
 	if err != nil {
 		return nil, fmt.Errorf("list workflows failed: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
 	for rows.Next() {
 		var (
@@ -320,11 +321,11 @@ WHERE id IN (`+placeholders+`)
 	return out, nil
 }
 
-func (s *MySQLStore) GetWorkflowRun(ctx context.Context, workflowRunID string) (*workflowRunModel, error) {
+func (s *MySQLStore) GetWorkflowRun(ctx context.Context, workflowRunID string) (*WorkflowRunModel, error) {
 	q := s.querier(ctx)
 
 	row := q.QueryRowContext(ctx, `
-SELECT id, workflow_id, data, completed_nodes, created_at, updated_at
+SELECT id, workflow_id, data, completed_nodes, trace_carrier, created_at, updated_at
 FROM workflow_runs
 WHERE id = ?
 `, workflowRunID)
@@ -348,11 +349,11 @@ WHERE id = ?
 	return run, nil
 }
 
-func (s *MySQLStore) ListPendingWorkflowRuns(ctx context.Context) ([]*workflowRunModel, error) {
+func (s *MySQLStore) ListPendingWorkflowRuns(ctx context.Context) ([]*WorkflowRunModel, error) {
 	q := s.querier(ctx)
 
 	rows, err := q.QueryContext(ctx, `
-SELECT r.id, r.workflow_id, r.data, r.completed_nodes, r.created_at, r.updated_at
+SELECT r.id, r.workflow_id, r.data, r.completed_nodes, r.trace_carrier, r.created_at, r.updated_at
 FROM workflow_runs r
 JOIN workflows w ON w.id = r.workflow_id
 WHERE w.total_nodes > r.completed_nodes
@@ -361,9 +362,9 @@ ORDER BY r.created_at ASC
 	if err != nil {
 		return nil, fmt.Errorf("list pending workflow runs failed: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
-	var runs []*workflowRunModel
+	var runs []*WorkflowRunModel
 	var runIDs []string
 	for rows.Next() {
 		run, err := scanWorkflowRunRow(rows)
@@ -393,7 +394,7 @@ ORDER BY r.created_at ASC
 	return runs, nil
 }
 
-func (s *MySQLStore) CreateWorkflowRun(ctx context.Context, workflowRun *workflowRunModel) (string, error) {
+func (s *MySQLStore) CreateWorkflowRun(ctx context.Context, workflowRun *WorkflowRunModel) (string, error) {
 	if workflowRun == nil {
 		return "", errors.New("nil workflow run")
 	}
@@ -408,13 +409,21 @@ func (s *MySQLStore) CreateWorkflowRun(ctx context.Context, workflowRun *workflo
 	if data == nil {
 		data = json.RawMessage("[]")
 	}
+	carrier := workflowRun.TraceCarrier
+	if carrier == nil {
+		carrier = map[string]string{}
+	}
+	carrierBytes, err := json.Marshal(carrier)
+	if err != nil {
+		return "", fmt.Errorf("marshal trace carrier failed: %w", err)
+	}
 	now := time.Now().UTC()
 	completed := workflowRun.CompletedNodes
 
 	if _, err := q.ExecContext(ctx, `
-INSERT INTO workflow_runs (id, workflow_id, data, completed_nodes, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?)
-`, id, workflowRun.WorkflowID, []byte(data), completed, now, now); err != nil {
+INSERT INTO workflow_runs (id, workflow_id, data, completed_nodes, trace_carrier, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+`, id, workflowRun.WorkflowID, []byte(data), completed, carrierBytes, now, now); err != nil {
 		return "", fmt.Errorf("insert workflow run failed: %w", err)
 	}
 
@@ -511,19 +520,28 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanWorkflowRunRow(row rowScanner) (*workflowRunModel, error) {
+func scanWorkflowRunRow(row rowScanner) (*WorkflowRunModel, error) {
 	var (
-		run       workflowRunModel
-		data      []byte
-		createdAt time.Time
-		updatedAt time.Time
+		run          WorkflowRunModel
+		data         []byte
+		traceCarrier []byte
+		createdAt    time.Time
+		updatedAt    time.Time
 	)
-	if err := row.Scan(&run.ID, &run.WorkflowID, &data, &run.CompletedNodes, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&run.ID, &run.WorkflowID, &data, &run.CompletedNodes, &traceCarrier, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	run.Data = append(json.RawMessage(nil), data...)
 	run.CreatedAt = createdAt
 	run.UpdatedAt = updatedAt
+	if len(traceCarrier) > 0 {
+		if err := json.Unmarshal(traceCarrier, &run.TraceCarrier); err != nil {
+			return nil, fmt.Errorf("unmarshal trace carrier failed: %w", err)
+		}
+	}
+	if run.TraceCarrier == nil {
+		run.TraceCarrier = map[string]string{}
+	}
 	return &run, nil
 }
 
@@ -542,7 +560,7 @@ WHERE workflow_run_id IN (`+placeholders+`)
 	if err != nil {
 		return nil, fmt.Errorf("load node executions failed: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
 	for rows.Next() {
 		var (
