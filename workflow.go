@@ -698,7 +698,13 @@ func getReadyNodeIDs(configs map[string]*NodeConfig, executions map[string]*Node
 			return nil
 
 		case NodeStatusPending:
-			readyNodeIDs = append(readyNodeIDs, nodeID)
+			config, ok := configs[nodeID]
+			if !ok {
+				return fmt.Errorf("failed to get config for %q", nodeID)
+			}
+			if execution.ReadyInDegree >= config.InDegree {
+				readyNodeIDs = append(readyNodeIDs, nodeID)
+			}
 			return nil
 
 		default:
