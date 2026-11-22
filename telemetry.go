@@ -15,15 +15,15 @@ const (
 )
 
 type TraceConfig struct {
-	tracer     trace.Tracer
-	attrs      []attribute.KeyValue
-	propagator propagation.TextMapPropagator
+	Tracer     trace.Tracer
+	Attrs      []attribute.KeyValue
+	Propagator propagation.TextMapPropagator
 }
 
 func defaultTraceConfig() TraceConfig {
 	return TraceConfig{
-		tracer: noop.NewTracerProvider().Tracer("workflow"),
-		propagator: propagation.NewCompositeTextMapPropagator(
+		Tracer: noop.NewTracerProvider().Tracer("workflow"),
+		Propagator: propagation.NewCompositeTextMapPropagator(
 			propagation.TraceContext{},
 			propagation.Baggage{},
 		),
@@ -31,11 +31,11 @@ func defaultTraceConfig() TraceConfig {
 }
 
 func (e *Engine) withSpan(ctx context.Context, spanName string, fn func(ctx context.Context, span trace.Span) error) error {
-	ctx, span := e.traceConfig.tracer.Start(
+	ctx, span := e.traceConfig.Tracer.Start(
 		ctx,
 		spanName,
 		trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(e.traceConfig.attrs...),
+		trace.WithAttributes(e.traceConfig.Attrs...),
 	)
 	defer span.End()
 

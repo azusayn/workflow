@@ -353,7 +353,7 @@ func (e *Engine) recoverWorkflowRuns(ctx context.Context) error {
 		}
 
 		carrier := propagation.MapCarrier(workflowRunModel.TraceCarrier)
-		runCtx := e.traceConfig.propagator.Extract(ctx, carrier)
+		runCtx := e.traceConfig.Propagator.Extract(ctx, carrier)
 		for _, nodeID := range readyNodeIDs {
 			e.readyCh <- &readyNodeTask{
 				nodeID:        nodeID,
@@ -502,7 +502,7 @@ func (w *Workflow) createWorkflowRun(ctx context.Context, pool *VariablePool, ex
 	var workflowRunID string
 	if err := w.engine.store.Transaction(ctx, func(ctx context.Context) error {
 		carrier := make(propagation.MapCarrier)
-		w.engine.traceConfig.propagator.Inject(ctx, carrier)
+		w.engine.traceConfig.Propagator.Inject(ctx, carrier)
 		var err error
 		workflowRunID, err = w.engine.store.CreateWorkflowRun(ctx, &WorkflowRunModel{
 			WorkflowID:     w.ID,
