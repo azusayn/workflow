@@ -7,44 +7,98 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
-	"go.opentelemetry.io/otel/trace/noop"
 )
+
+type AttributeKey string
 
 const (
-	attrKeyWorkflowRunID = attribute.Key("workflow.workflow_run_id")
+	AttributeKeyWorkflowRunID AttributeKey = "workflow.workflow_run_id"
 )
 
-type TraceConfig struct {
-	Tracer     trace.Tracer
-	Attrs      []attribute.KeyValue
-	Propagator propagation.TextMapPropagator
+type SetSpanAttributeFunc func(key AttributeKey, value string)
+
+type Tracer interface {
+	WithSpan(ctx context.Context, spanName string, fn func(ctx context.Context, setAttribute SetSpanAttributeFunc) error) error
 }
 
-func defaultTraceConfig() TraceConfig {
-	return TraceConfig{
-		Tracer: noop.NewTracerProvider().Tracer("workflow"),
-		Propagator: propagation.NewCompositeTextMapPropagator(
-			propagation.TraceContext{},
-			propagation.Baggage{},
-		),
+type Propagator interface {
+	Extract(ctx context.Context, carrier map[string]string) context.Context
+	Inject(ctx context.Context, carrier map[string]string)
+}
+
+type noopTracer struct{}
+
+func newNoopTracer() Tracer {
+	return &noopTracer{}
+}
+
+func (t *noopTracer) WithSpan(
+	ctx context.Context,
+	spanName string,
+	fn func(ctx context.Context, setAttribute SetSpanAttributeFunc) error,
+) error {
+	setAttribute := func(AttributeKey, string) {}
+	return fn(ctx, setAttribute)
+}
+
+type noopPropagator struct{}
+
+func newNoopPropagator() Propagator {
+	return &noopPropagator{}
+}
+func (p *noopPropagator) Extract(ctx context.Context, _ map[string]string) context.Context {
+	return ctx
+}
+
+func (p *noopPropagator) Inject(_ context.Context, _ map[string]string) {}
+
+type otelTracer struct {
+	tracer     trace.Tracer
+	attributes []attribute.KeyValue
+}
+
+func NewOTelTracer(tracer trace.Tracer, attributes ...attribute.KeyValue) Tracer {
+	return &otelTracer{
+		tracer:     tracer,
+		attributes: attributes,
 	}
 }
 
-func (e *Engine) withSpan(ctx context.Context, spanName string, fn func(ctx context.Context, span trace.Span) error) error {
-	ctx, span := e.traceConfig.Tracer.Start(
+func (t *otelTracer) WithSpan(ctx context.Context, spanName string, fn func(ctx context.Context, setAttribute SetSpanAttributeFunc) error) error {
+	ctx, span := t.tracer.Start(
 		ctx,
 		spanName,
 		trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(e.traceConfig.Attrs...),
+		trace.WithAttributes(t.attributes...),
 	)
 	defer span.End()
 
-	err := fn(ctx, span)
+	setAttribute := func(key AttributeKey, value string) {
+		span.SetAttributes(attribute.Key(key).String(value))
+	}
 
-	if err != nil {
+	if err := fn(ctx, setAttribute); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 	}
 
-	return err
+	return nil
+}
+
+type OTelPropagator struct {
+	propagator propagation.TextMapPropagator
+}
+
+func NewOTelPropagator(propagator propagation.TextMapPropagator) Propagator {
+	return &OTelPropagator{
+		propagator: propagator,
+	}
+}
+
+func (p *OTelPropagator) Extract(ctx context.Context, carrier map[string]string) context.Context {
+	return p.propagator.Extract(ctx, propagation.MapCarrier(carrier))
+}
+
+func (p *OTelPropagator) Inject(ctx context.Context, carrier map[string]string) {
+	p.propagator.Inject(ctx, propagation.MapCarrier(carrier))
 }

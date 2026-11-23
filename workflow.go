@@ -8,9 +8,6 @@ import (
 	"log/slog"
 	"sync"
 	"time"
-
-	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -24,11 +21,9 @@ const (
 )
 
 type Engine struct {
-	store WorkflowStore
-
-	// TODO: decouple from OTel SDK.
-	traceConfig TraceConfig
-
+	store                WorkflowStore
+	tracer               Tracer
+	propagator           Propagator
 	logger               *slog.Logger
 	nodeExecutorNum      int
 	nodeExecutionTimeout time.Duration
@@ -109,15 +104,18 @@ func WithStore(store WorkflowStore) EngineOption {
 	}
 }
 
-func WithTraceConfig(config TraceConfig) EngineOption {
+func WithTracing(tracer Tracer, propagator Propagator) EngineOption {
 	return func(e *Engine) {
-		e.traceConfig = config
+		e.tracer = tracer
+		e.propagator = propagator
 	}
 }
 
 func NewEngine(opts ...EngineOption) *Engine {
 	e := &Engine{
 		store:                newNoopStore(),
+		tracer:               newNoopTracer(),
+		propagator:           newNoopPropagator(),
 		nodeExecutionTimeout: defaultNodeExecutionTimeout,
 		logger:               slog.Default(),
 		nodeExecutorNum:      defaultNodeExecutorNum,
@@ -128,7 +126,6 @@ func NewEngine(opts ...EngineOption) *Engine {
 		subscriberMap:        make(map[string]map[string]struct{}),
 		activeConditions:     make(map[string]Condition),
 		checkerByConditionID: make(map[string]func(context.Context, any) (bool, error)),
-		traceConfig:          defaultTraceConfig(),
 	}
 
 	for _, opt := range opts {
@@ -140,14 +137,17 @@ func NewEngine(opts ...EngineOption) *Engine {
 
 func (e *Engine) CreateWorkflow(ctx context.Context, name string, nodeConfigs map[string]*NodeConfig) (*Workflow, error) {
 	var workflow *Workflow
-	var err = e.withSpan(ctx, "workflow.CreateWorkflow", func(ctx context.Context, span trace.Span) error {
+
+	fn := func(ctx context.Context, _ SetSpanAttributeFunc) error {
 		if v, err := e.createWorkflow(ctx, name, nodeConfigs); err != nil {
 			return err
 		} else {
 			workflow = v
 		}
 		return nil
-	})
+	}
+	var err = e.tracer.WithSpan(ctx, "workflow.CreateWorkflow", fn)
+
 	return workflow, err
 }
 
@@ -175,9 +175,10 @@ func (e *Engine) GetWorkflowRun(ctx context.Context, workflowRunID string) (*Wor
 }
 
 func (e *Engine) RecoverWorkflowRuns(ctx context.Context) error {
-	return e.withSpan(ctx, "workflow.RecoverWorkflowRuns", func(ctx context.Context, span trace.Span) error {
+	fn := func(ctx context.Context, _ SetSpanAttributeFunc) error {
 		return e.recoverWorkflowRuns(ctx)
-	})
+	}
+	return e.tracer.WithSpan(ctx, "workflow.RecoverWorkflowRuns", fn)
 }
 
 func (e *Engine) StartNodeExecutors(ctx context.Context) error {
@@ -194,15 +195,16 @@ func (e *Engine) StartNodeExecutors(ctx context.Context) error {
 
 				var nodeStatus NodeStatus
 				spanName := fmt.Sprintf("workflow.ExecuteNode: %s", task.nodeID)
-				if err := e.withSpan(task.ctx, spanName, func(ctx context.Context, span trace.Span) error {
-					span.SetAttributes(attrKeyWorkflowRunID.String(task.workflowRunID))
+				fn := func(ctx context.Context, setAttribute SetSpanAttributeFunc) error {
+					setAttribute(AttributeKeyWorkflowRunID, task.workflowRunID)
 					if v, err := run.execute(ctx, task.nodeID); err != nil {
 						return err
 					} else {
 						nodeStatus = v
 					}
 					return nil
-				}); err != nil {
+				}
+				if err := e.tracer.WithSpan(task.ctx, spanName, fn); err != nil {
 					logger.ErrorContext(task.ctx, "failed to execute node", slog.Any("err", err))
 					continue
 				}
@@ -352,8 +354,7 @@ func (e *Engine) recoverWorkflowRuns(ctx context.Context) error {
 			continue
 		}
 
-		carrier := propagation.MapCarrier(workflowRunModel.TraceCarrier)
-		runCtx := e.traceConfig.Propagator.Extract(ctx, carrier)
+		runCtx := e.propagator.Extract(ctx, workflowRunModel.TraceCarrier)
 		for _, nodeID := range readyNodeIDs {
 			e.readyCh <- &readyNodeTask{
 				nodeID:        nodeID,
@@ -452,15 +453,18 @@ func (e *Engine) checkAndPurgeInactiveRun(run *workflowRun) {
 
 func (w *Workflow) Run(ctx context.Context, data map[string]any) (string, error) {
 	var workflowRunID string
-	var err = w.engine.withSpan(ctx, "workflow.Run", func(ctx context.Context, span trace.Span) error {
+
+	fn := func(ctx context.Context, setAttribute SetSpanAttributeFunc) error {
 		if v, err := w.run(ctx, data); err != nil {
 			return err
 		} else {
 			workflowRunID = v
 		}
-		span.SetAttributes(attrKeyWorkflowRunID.String(workflowRunID))
+		setAttribute(AttributeKeyWorkflowRunID, workflowRunID)
 		return nil
-	})
+	}
+	var err = w.engine.tracer.WithSpan(ctx, "workflow.Run", fn)
+
 	return workflowRunID, err
 }
 
@@ -501,8 +505,8 @@ func (w *Workflow) createWorkflowRun(ctx context.Context, pool *VariablePool, ex
 
 	var workflowRunID string
 	if err := w.engine.store.Transaction(ctx, func(ctx context.Context) error {
-		carrier := make(propagation.MapCarrier)
-		w.engine.traceConfig.Propagator.Inject(ctx, carrier)
+		carrier := make(map[string]string)
+		w.engine.propagator.Inject(ctx, carrier)
 		var err error
 		workflowRunID, err = w.engine.store.CreateWorkflowRun(ctx, &WorkflowRunModel{
 			WorkflowID:     w.ID,
