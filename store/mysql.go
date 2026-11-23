@@ -1,4 +1,4 @@
-package workflow
+package store
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 	"github.com/google/uuid"
 )
 
-var _ WorkflowStore = (*MySQLStore)(nil)
+var _ Store = (*MySQLStore)(nil)
 
 type mysqlStoreTxKey struct{}
 
@@ -156,7 +156,7 @@ ON DUPLICATE KEY UPDATE event_ids = VALUES(event_ids), updated_at = VALUES(updat
 	return nil
 }
 
-func (s *MySQLStore) LoadConditions(ctx context.Context) (map[string]ConditionModel, error) {
+func (s *MySQLStore) LoadConditions(ctx context.Context) (map[string]Condition, error) {
 	q := s.querier(ctx)
 	rows, err := q.QueryContext(ctx, `
 SELECT subscriber_id, condition_id, event_id, payload FROM workflow_conditions
@@ -166,10 +166,10 @@ SELECT subscriber_id, condition_id, event_id, payload FROM workflow_conditions
 	}
 	defer rows.Close() //nolint:errcheck
 
-	out := make(map[string]ConditionModel)
+	out := make(map[string]Condition)
 	for rows.Next() {
 		var subscriberID string
-		var model ConditionModel
+		var model Condition
 		var payload []byte
 		if err := rows.Scan(&subscriberID, &model.ID, &model.EventID, &payload); err != nil {
 			return nil, err
@@ -213,7 +213,7 @@ DELETE FROM workflow_conditions WHERE subscriber_id = ?
 	return nil
 }
 
-func (s *MySQLStore) GetOrCreateWorkflow(ctx context.Context, name string, nodeConfigs map[string]*NodeConfig) (*WorkflowModel, error) {
+func (s *MySQLStore) GetOrCreateWorkflow(ctx context.Context, name string, nodeConfigs map[string]*NodeConfig) (*Workflow, error) {
 	q := s.querier(ctx)
 
 	configsRaw, err := marshalNodeConfigs(nodeConfigs)
@@ -236,7 +236,7 @@ WHERE id = ?
 `, totalNodes, configsRaw, now, id); err != nil {
 			return nil, fmt.Errorf("update workflow failed: %w", err)
 		}
-		return &WorkflowModel{
+		return &Workflow{
 			ID:          id,
 			Name:        name,
 			TotalNodes:  totalNodes,
@@ -266,7 +266,7 @@ WHERE id = ?
 `, totalNodes, configsRaw, now, existingID); err != nil {
 			return nil, fmt.Errorf("update workflow failed: %w", err)
 		}
-		return &WorkflowModel{
+		return &Workflow{
 			ID:          existingID,
 			Name:        name,
 			TotalNodes:  totalNodes,
@@ -274,7 +274,7 @@ WHERE id = ?
 		}, nil
 	}
 
-	return &WorkflowModel{
+	return &Workflow{
 		ID:          id,
 		Name:        name,
 		TotalNodes:  totalNodes,
@@ -282,8 +282,8 @@ WHERE id = ?
 	}, nil
 }
 
-func (s *MySQLStore) ListWorkflows(ctx context.Context, ids []string) ([]*WorkflowModel, error) {
-	out := make([]*WorkflowModel, 0, len(ids))
+func (s *MySQLStore) ListWorkflows(ctx context.Context, ids []string) ([]*Workflow, error) {
+	out := make([]*Workflow, 0, len(ids))
 	if len(ids) == 0 {
 		return out, nil
 	}
@@ -302,7 +302,7 @@ WHERE id IN (`+placeholders+`)
 
 	for rows.Next() {
 		var (
-			model      WorkflowModel
+			model      Workflow
 			configsRaw []byte
 		)
 		if err := rows.Scan(&model.ID, &model.Name, &model.TotalNodes, &configsRaw); err != nil {
@@ -321,7 +321,7 @@ WHERE id IN (`+placeholders+`)
 	return out, nil
 }
 
-func (s *MySQLStore) GetWorkflowRun(ctx context.Context, workflowRunID string) (*WorkflowRunModel, error) {
+func (s *MySQLStore) GetWorkflowRun(ctx context.Context, workflowRunID string) (*WorkflowRun, error) {
 	q := s.querier(ctx)
 
 	row := q.QueryRowContext(ctx, `
@@ -349,7 +349,7 @@ WHERE id = ?
 	return run, nil
 }
 
-func (s *MySQLStore) ListPendingWorkflowRuns(ctx context.Context) ([]*WorkflowRunModel, error) {
+func (s *MySQLStore) ListPendingWorkflowRuns(ctx context.Context) ([]*WorkflowRun, error) {
 	q := s.querier(ctx)
 
 	rows, err := q.QueryContext(ctx, `
@@ -364,7 +364,7 @@ ORDER BY r.created_at ASC
 	}
 	defer rows.Close() //nolint:errcheck
 
-	var runs []*WorkflowRunModel
+	var runs []*WorkflowRun
 	var runIDs []string
 	for rows.Next() {
 		run, err := scanWorkflowRunRow(rows)
@@ -394,7 +394,7 @@ ORDER BY r.created_at ASC
 	return runs, nil
 }
 
-func (s *MySQLStore) CreateWorkflowRun(ctx context.Context, workflowRun *WorkflowRunModel) (string, error) {
+func (s *MySQLStore) CreateWorkflowRun(ctx context.Context, workflowRun *WorkflowRun) (string, error) {
 	if workflowRun == nil {
 		return "", errors.New("nil workflow run")
 	}
@@ -520,9 +520,9 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanWorkflowRunRow(row rowScanner) (*WorkflowRunModel, error) {
+func scanWorkflowRunRow(row rowScanner) (*WorkflowRun, error) {
 	var (
-		run          WorkflowRunModel
+		run          WorkflowRun
 		data         []byte
 		traceCarrier []byte
 		createdAt    time.Time

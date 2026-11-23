@@ -1,4 +1,4 @@
-package workflow
+package telemetry
 
 import (
 	"context"
@@ -8,54 +8,6 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
-
-type AttributeKey string
-
-const (
-	AttributeKeyWorkflowRunID AttributeKey = "workflow.workflow_run_id"
-)
-
-type SetSpanAttributeFunc func(key AttributeKey, value string)
-
-type Tracer interface {
-	WithSpan(ctx context.Context, spanName string, fn func(ctx context.Context, setAttribute SetSpanAttributeFunc) error) error
-}
-
-type Propagator interface {
-	Extract(ctx context.Context, carrier map[string]string) context.Context
-	Inject(ctx context.Context, carrier map[string]string)
-}
-
-type noopTracer struct{}
-
-func newNoopTracer() Tracer {
-	return &noopTracer{}
-}
-
-func (t *noopTracer) WithSpan(
-	ctx context.Context,
-	spanName string,
-	fn func(ctx context.Context, setAttribute SetSpanAttributeFunc) error,
-) error {
-	setAttribute := func(AttributeKey, string) {}
-	return fn(ctx, setAttribute)
-}
-
-type noopPropagator struct{}
-
-func newNoopPropagator() Propagator {
-	return &noopPropagator{}
-}
-func (p *noopPropagator) Extract(ctx context.Context, _ map[string]string) context.Context {
-	return ctx
-}
-
-func (p *noopPropagator) Inject(_ context.Context, _ map[string]string) {}
-
-type otelTracer struct {
-	tracer     trace.Tracer
-	attributes []attribute.KeyValue
-}
 
 func NewOTelTracer(tracer trace.Tracer, attributes ...attribute.KeyValue) Tracer {
 	return &otelTracer{

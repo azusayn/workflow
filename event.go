@@ -216,12 +216,13 @@ func (e *Engine) handleWorkflowEvent(ctx context.Context, event *WorkflowEvent) 
 		defer run.mu.Unlock()
 
 		run.executions[event.NodeID] = exec
-		if err := e.store.UpdateWorkflowRun(ctx, UpdateWorkflowRunInput{
-			WorkflowRunID:      run.id,
-			NodeID:             &event.NodeID,
-			Execution:          exec,
-			IncrementCompleted: exec.Status == NodeStatusCompleted || exec.Status == NodeStatusFailed,
-		}); err != nil {
+		if err := e.store.UpdateWorkflowRun(ctx, convertToStoreUpdateWorkflowRunInput(
+			run.id,
+			&event.NodeID,
+			exec,
+			nil,
+			exec.Status == NodeStatusCompleted || exec.Status == NodeStatusFailed,
+		)); err != nil {
 			return nil
 		}
 

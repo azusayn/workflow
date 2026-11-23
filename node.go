@@ -6,6 +6,7 @@ import (
 	"sync"
 )
 
+// TODO: distinguish between node types and node IDs.
 const RootNodeID = "root"
 
 type NodeStatus string

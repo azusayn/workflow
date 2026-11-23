@@ -8,6 +8,9 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/azusayn/workflow/store"
+	"github.com/azusayn/workflow/telemetry"
 )
 
 const (
@@ -15,15 +18,16 @@ const (
 	workflowEventChannelCapacity = 1000
 	defaultNodeExecutorNum       = 4
 	// TODO: support per-node timeout policy.
-	defaultNodeExecutionTimeout   = 3 * time.Second
-	defaultConditionCheckTimout   = 1 * time.Second
-	defaultConditionCheckInterval = 1 * time.Second
+	defaultNodeExecutionTimeout                          = 3 * time.Second
+	defaultConditionCheckTimout                          = 1 * time.Second
+	defaultConditionCheckInterval                        = 1 * time.Second
+	attributeKeyWorkflowRunID     telemetry.AttributeKey = "workflow.workflow_run_id"
 )
 
 type Engine struct {
-	store                WorkflowStore
-	tracer               Tracer
-	propagator           Propagator
+	store                store.Store
+	tracer               telemetry.Tracer
+	propagator           telemetry.Propagator
 	logger               *slog.Logger
 	nodeExecutorNum      int
 	nodeExecutionTimeout time.Duration
@@ -55,6 +59,11 @@ type NodeConfig struct {
 	InDegree        int
 	NextNodeIDs     []string
 	ContinueOnError bool
+}
+type NodeExecution struct {
+	ReadyInDegree int
+	Err           error
+	Status        NodeStatus
 }
 
 type WorkflowRunStatus struct {
@@ -98,13 +107,13 @@ func WithNodeExecutionTimeout(duration time.Duration) EngineOption {
 	}
 }
 
-func WithStore(store WorkflowStore) EngineOption {
+func WithStore(store store.Store) EngineOption {
 	return func(e *Engine) {
 		e.store = store
 	}
 }
 
-func WithTracing(tracer Tracer, propagator Propagator) EngineOption {
+func WithTracing(tracer telemetry.Tracer, propagator telemetry.Propagator) EngineOption {
 	return func(e *Engine) {
 		e.tracer = tracer
 		e.propagator = propagator
@@ -113,9 +122,9 @@ func WithTracing(tracer Tracer, propagator Propagator) EngineOption {
 
 func NewEngine(opts ...EngineOption) *Engine {
 	e := &Engine{
-		store:                newNoopStore(),
-		tracer:               newNoopTracer(),
-		propagator:           newNoopPropagator(),
+		store:                store.NewNoopStore(),
+		tracer:               telemetry.NewNoopTracer(),
+		propagator:           telemetry.NewNoopPropagator(),
 		nodeExecutionTimeout: defaultNodeExecutionTimeout,
 		logger:               slog.Default(),
 		nodeExecutorNum:      defaultNodeExecutorNum,
@@ -138,7 +147,7 @@ func NewEngine(opts ...EngineOption) *Engine {
 func (e *Engine) CreateWorkflow(ctx context.Context, name string, nodeConfigs map[string]*NodeConfig) (*Workflow, error) {
 	var workflow *Workflow
 
-	fn := func(ctx context.Context, _ SetSpanAttributeFunc) error {
+	fn := func(ctx context.Context, _ telemetry.SetSpanAttributeFunc) error {
 		if v, err := e.createWorkflow(ctx, name, nodeConfigs); err != nil {
 			return err
 		} else {
@@ -169,13 +178,13 @@ func (e *Engine) GetWorkflowRun(ctx context.Context, workflowRunID string) (*Wor
 		if exec == nil {
 			continue
 		}
-		status.NodeExecutions[nodeID] = *exec
+		status.NodeExecutions[nodeID] = *convertToNodeExecution(exec)
 	}
 	return status, nil
 }
 
 func (e *Engine) RecoverWorkflowRuns(ctx context.Context) error {
-	fn := func(ctx context.Context, _ SetSpanAttributeFunc) error {
+	fn := func(ctx context.Context, _ telemetry.SetSpanAttributeFunc) error {
 		return e.recoverWorkflowRuns(ctx)
 	}
 	return e.tracer.WithSpan(ctx, "workflow.RecoverWorkflowRuns", fn)
@@ -193,19 +202,23 @@ func (e *Engine) StartNodeExecutors(ctx context.Context) error {
 					continue
 				}
 
-				var nodeStatus NodeStatus
-				spanName := fmt.Sprintf("workflow.ExecuteNode: %s", task.nodeID)
-				fn := func(ctx context.Context, setAttribute SetSpanAttributeFunc) error {
-					setAttribute(AttributeKeyWorkflowRunID, task.workflowRunID)
-					if v, err := run.execute(ctx, task.nodeID); err != nil {
-						return err
-					} else {
-						nodeStatus = v
-					}
-					return nil
-				}
-				if err := e.tracer.WithSpan(task.ctx, spanName, fn); err != nil {
+				var (
+					nodeStatus NodeStatus = NodeStatusPending
+					condition  Condition
+				)
+
+				execErr := run.execute(ctx, task.nodeID, &nodeStatus, &condition)
+				if execErr != nil {
 					logger.ErrorContext(task.ctx, "failed to execute node", slog.Any("err", err))
+				}
+
+				if err = run.reconcileNodeStatus(ctx, task.nodeID, &nodeStatus, condition, execErr); err != nil {
+					logger.ErrorContext(ctx, "failed to reconcile node status", slog.Any("err", err))
+					continue
+				}
+
+				if err := run.persistNodeState(ctx, task.nodeID, nodeStatus, execErr); err != nil {
+					logger.ErrorContext(ctx, "failed to persist node state", slog.Any("err", err))
 					continue
 				}
 
@@ -263,7 +276,7 @@ func (e *Engine) createWorkflow(ctx context.Context, name string, nodeConfigs ma
 		}
 	}
 
-	workflowModel, err := e.store.GetOrCreateWorkflow(ctx, name, nodeConfigs)
+	workflowModel, err := e.store.GetOrCreateWorkflow(ctx, name, convertToStoreNodeConfigs(nodeConfigs))
 	if err != nil {
 		return nil, err
 	}
@@ -291,13 +304,7 @@ func (e *Engine) recoverWorkflowRuns(ctx context.Context) error {
 
 	activeConditions := make(map[string]Condition, len(conditionData))
 	for subscriberID, model := range conditionData {
-		conditionID := model.ID
-		payload := append(json.RawMessage(nil), model.Payload...)
-		activeConditions[subscriberID] = Condition{
-			ID:      &conditionID,
-			EventID: model.EventID,
-			Payload: payload,
-		}
+		activeConditions[subscriberID] = convertToCondition(model)
 	}
 
 	e.mu.Lock()
@@ -320,7 +327,7 @@ func (e *Engine) recoverWorkflowRuns(ctx context.Context) error {
 		return err
 	}
 	for _, workflow := range workflows {
-		nodeConfigsMap[workflow.ID] = workflow.NodeConfigs
+		nodeConfigsMap[workflow.ID] = convertToNodeConfigs(workflow.NodeConfigs)
 	}
 
 	for _, workflowRunModel := range workflowRunModels {
@@ -343,12 +350,12 @@ func (e *Engine) recoverWorkflowRuns(ctx context.Context) error {
 			e,
 			workflowRunModel.ID,
 			pool,
-			workflowRunModel.NodeExecutions,
+			convertToNodeExecutions(workflowRunModel.NodeExecutions),
 			nodeConfigs,
 		)
 		e.mu.Unlock()
 
-		readyNodeIDs, err := getReadyNodeIDs(nodeConfigs, workflowRunModel.NodeExecutions)
+		readyNodeIDs, err := getReadyNodeIDs(nodeConfigs, convertToNodeExecutions(workflowRunModel.NodeExecutions))
 		if err != nil {
 			logger.ErrorContext(ctx, "failed to get ready nodes", slog.Any("err", err))
 			continue
@@ -416,11 +423,13 @@ func (e *Engine) updateAndCheckReadyInDegree(ctx context.Context, nodeConfigs ma
 	}
 	exec.ReadyInDegree++
 
-	if err := e.store.UpdateWorkflowRun(ctx, UpdateWorkflowRunInput{
-		WorkflowRunID: run.id,
-		NodeID:        &nodeID,
-		Execution:     exec,
-	}); err != nil {
+	if err := e.store.UpdateWorkflowRun(ctx, convertToStoreUpdateWorkflowRunInput(
+		run.id,
+		&nodeID,
+		exec,
+		nil,
+		false,
+	)); err != nil {
 		return false, err
 	}
 
@@ -454,13 +463,13 @@ func (e *Engine) checkAndPurgeInactiveRun(run *workflowRun) {
 func (w *Workflow) Run(ctx context.Context, data map[string]any) (string, error) {
 	var workflowRunID string
 
-	fn := func(ctx context.Context, setAttribute SetSpanAttributeFunc) error {
+	fn := func(ctx context.Context, setAttribute telemetry.SetSpanAttributeFunc) error {
 		if v, err := w.run(ctx, data); err != nil {
 			return err
 		} else {
 			workflowRunID = v
 		}
-		setAttribute(AttributeKeyWorkflowRunID, workflowRunID)
+		setAttribute(attributeKeyWorkflowRunID, workflowRunID)
 		return nil
 	}
 	var err = w.engine.tracer.WithSpan(ctx, "workflow.Run", fn)
@@ -508,12 +517,12 @@ func (w *Workflow) createWorkflowRun(ctx context.Context, pool *VariablePool, ex
 		carrier := make(map[string]string)
 		w.engine.propagator.Inject(ctx, carrier)
 		var err error
-		workflowRunID, err = w.engine.store.CreateWorkflowRun(ctx, &WorkflowRunModel{
-			WorkflowID:     w.ID,
-			Data:           data,
-			NodeExecutions: executions,
-			TraceCarrier:   carrier,
-		})
+		workflowRunID, err = w.engine.store.CreateWorkflowRun(ctx, convertToStoreWorkflowRunModel(
+			w.ID,
+			data,
+			executions,
+			carrier,
+		))
 		return err
 	}); err != nil {
 		return "", err
@@ -546,82 +555,91 @@ func newWorkflowRun(
 	}
 }
 
-func (r *workflowRun) execute(ctx context.Context, nodeID string) (NodeStatus, error) {
-	nodeStatus := NodeStatusPending
-
-	// TODO: distinguish between node types and node IDs.
-	act, ok := Lookup(nodeID)
-	if !ok {
-		return nodeStatus, fmt.Errorf("node type %q not registered", nodeID)
-	}
-
-	condition := &Condition{}
-	ctx = withNodeID(ctx, nodeID)
-	ctx = withWorkflowRun(ctx, r)
-	ctx = withNodeStatus(ctx, &nodeStatus)
-	ctx = withCondition(ctx, condition)
-
-	ctx, cancel := context.WithTimeout(ctx, r.engine.nodeExecutionTimeout)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		done <- act.Execute(ctx)
-	}()
-	var execErr error
-	select {
-	case err := <-done:
-		if err != nil {
-			nodeStatus = NodeStatusFailed
-			execErr = err
+func (r *workflowRun) execute(ctx context.Context, nodeID string, nodeStatus *NodeStatus, condition *Condition) error {
+	fn := func(ctx context.Context, setAttribute telemetry.SetSpanAttributeFunc) error {
+		setAttribute(attributeKeyWorkflowRunID, r.id)
+		ctx = withNodeID(ctx, nodeID)
+		ctx = withWorkflowRun(ctx, r)
+		ctx = withNodeStatus(ctx, nodeStatus)
+		ctx = withCondition(ctx, condition)
+		node, ok := Lookup(nodeID)
+		if !ok {
+			return fmt.Errorf("node type %q not registered", nodeID)
 		}
-	case <-ctx.Done():
-		return NodeStatusPending, ctx.Err()
+
+		ctx, cancel := context.WithTimeout(ctx, r.engine.nodeExecutionTimeout)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- node.Execute(ctx)
+		}()
+
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	spanName := fmt.Sprintf("workflow.ExecuteNode: %s", nodeID)
+	return r.engine.tracer.WithSpan(ctx, spanName, fn)
+}
+
+func (r *workflowRun) reconcileNodeStatus(ctx context.Context, nodeID string, nodeStatus *NodeStatus, condition Condition, execErr error) error {
+	if nodeStatus == nil {
+		return errors.New("nil node status")
+	}
+	if execErr != nil {
+		*nodeStatus = NodeStatusFailed
 	}
 
-	switch nodeStatus {
+	switch *nodeStatus {
 	case NodeStatusFailed:
 		config, ok := r.nodeConfigs[nodeID]
 		if !ok {
-			return NodeStatusPending, fmt.Errorf("failed to find config for %q", nodeID)
+			return fmt.Errorf("failed to find config for %q", nodeID)
 		}
 		if config.ContinueOnError {
 			slog.WarnContext(ctx, "node exection failed but allowed to continue", slog.Any("err", execErr), slog.Any("node_id", nodeID))
-			nodeStatus = NodeStatusCompleted
+			*nodeStatus = NodeStatusCompleted
 		}
 
 	case NodeStatusPause:
-		if err := r.engine.subscribeEvent(ctx, r.id, nodeID, *condition); err != nil {
-			return nodeStatus, err
+		if err := r.engine.subscribeEvent(ctx, r.id, nodeID, condition); err != nil {
+			return err
 		}
 
 	case NodeStatusPending:
-		nodeStatus = NodeStatusCompleted
+		*nodeStatus = NodeStatusCompleted
 
 	default:
-		return nodeStatus, fmt.Errorf("node %q entered invalid status %q", nodeID, nodeStatus)
+		return fmt.Errorf("node %q entered invalid status %q", nodeID, *nodeStatus)
 	}
 
+	return nil
+}
+
+func (r *workflowRun) persistNodeState(ctx context.Context, nodeID string, nodeStatus NodeStatus, execErr error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	bytes, err := r.pool.Dump()
 	if err != nil {
-		return nodeStatus, err
+		return err
 	}
-
 	nodeExecution := NodeExecution{
 		Status: nodeStatus,
 		Err:    execErr,
 	}
 
-	if err := r.engine.store.Transaction(ctx, func(ctx context.Context) error {
-		if err := r.engine.store.UpdateWorkflowRun(ctx, UpdateWorkflowRunInput{
-			WorkflowRunID:      r.id,
-			NodeID:             &nodeID,
-			Execution:          &nodeExecution,
-			Data:               &bytes,
-			IncrementCompleted: nodeStatus == NodeStatusCompleted || nodeStatus == NodeStatusFailed,
-		}); err != nil {
+	return r.engine.store.Transaction(ctx, func(ctx context.Context) error {
+		if err := r.engine.store.UpdateWorkflowRun(ctx, convertToStoreUpdateWorkflowRunInput(
+			r.id,
+			&nodeID,
+			&nodeExecution,
+			&bytes,
+			nodeStatus == NodeStatusCompleted || nodeStatus == NodeStatusFailed,
+		)); err != nil {
 			return err
 		}
 		exec, ok := r.executions[nodeID]
@@ -633,11 +651,7 @@ func (r *workflowRun) execute(ctx context.Context, nodeID string) (NodeStatus, e
 			return r.skipSuccessors(ctx, nodeID)
 		}
 		return nil
-	}); err != nil {
-		return nodeStatus, err
-	}
-
-	return nodeStatus, nil
+	})
 }
 
 func (r *workflowRun) skipSuccessors(ctx context.Context, nodeID string) error {
@@ -668,12 +682,13 @@ func (r *workflowRun) skipSuccessors(ctx context.Context, nodeID string) error {
 			return fmt.Errorf("failed to get execution for node %q", nodeID)
 		}
 		exec.Status = NodeStatusSkipped
-		if err := r.engine.store.UpdateWorkflowRun(ctx, UpdateWorkflowRunInput{
-			WorkflowRunID:      r.id,
-			NodeID:             &nodeID,
-			Execution:          exec,
-			IncrementCompleted: true,
-		}); err != nil {
+		if err := r.engine.store.UpdateWorkflowRun(ctx, convertToStoreUpdateWorkflowRunInput(
+			r.id,
+			&nodeID,
+			exec,
+			nil,
+			true,
+		)); err != nil {
 			return err
 		}
 	}
