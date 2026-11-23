@@ -2,9 +2,6 @@ package telemetry
 
 import (
 	"context"
-
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 )
 
 type noopTracer struct{}
@@ -32,8 +29,3 @@ func (p *noopPropagator) Extract(ctx context.Context, _ map[string]string) conte
 }
 
 func (p *noopPropagator) Inject(_ context.Context, _ map[string]string) {}
-
-type otelTracer struct {
-	tracer     trace.Tracer
-	attributes []attribute.KeyValue
-}

@@ -9,6 +9,11 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+type otelTracer struct {
+	tracer     trace.Tracer
+	attributes []attribute.KeyValue
+}
+
 func NewOTelTracer(tracer trace.Tracer, attributes ...attribute.KeyValue) Tracer {
 	return &otelTracer{
 		tracer:     tracer,
@@ -37,20 +42,20 @@ func (t *otelTracer) WithSpan(ctx context.Context, spanName string, fn func(ctx 
 	return nil
 }
 
-type OTelPropagator struct {
+type otelPropagator struct {
 	propagator propagation.TextMapPropagator
 }
 
 func NewOTelPropagator(propagator propagation.TextMapPropagator) Propagator {
-	return &OTelPropagator{
+	return &otelPropagator{
 		propagator: propagator,
 	}
 }
 
-func (p *OTelPropagator) Extract(ctx context.Context, carrier map[string]string) context.Context {
+func (p *otelPropagator) Extract(ctx context.Context, carrier map[string]string) context.Context {
 	return p.propagator.Extract(ctx, propagation.MapCarrier(carrier))
 }
 
-func (p *OTelPropagator) Inject(ctx context.Context, carrier map[string]string) {
+func (p *otelPropagator) Inject(ctx context.Context, carrier map[string]string) {
 	p.propagator.Inject(ctx, propagation.MapCarrier(carrier))
 }

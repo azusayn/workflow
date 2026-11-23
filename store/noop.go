@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-
-	"github.com/google/uuid"
 )
 
 var _ Store = (*noopStore)(nil)
@@ -41,7 +39,11 @@ func (s *noopStore) DeleteCondition(context.Context, string) error {
 }
 
 func (s *noopStore) GetOrCreateWorkflow(context.Context, string, map[string]*NodeConfig) (*Workflow, error) {
-	return &Workflow{ID: uuid.NewString()}, nil
+	id, err := UUID()
+	if err != nil {
+		return nil, err
+	}
+	return &Workflow{ID: id}, nil
 }
 
 func (s *noopStore) ListWorkflows(context.Context, []string) ([]*Workflow, error) {
@@ -57,7 +59,11 @@ func (s *noopStore) ListPendingWorkflowRuns(context.Context) ([]*WorkflowRun, er
 }
 
 func (s *noopStore) CreateWorkflowRun(_ context.Context, _ *WorkflowRun) (string, error) {
-	return uuid.NewString(), nil
+	id, err := UUID()
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func (s *noopStore) UpdateWorkflowRun(context.Context, UpdateWorkflowRunInput) error {
