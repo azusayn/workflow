@@ -223,7 +223,7 @@ func (e *Engine) handleWorkflowEvent(ctx context.Context, event *WorkflowEvent) 
 			nil,
 			exec.Status == NodeStatusCompleted || exec.Status == NodeStatusFailed,
 		)); err != nil {
-			return nil
+			return err
 		}
 
 		if exec.Status == NodeStatusFailed {

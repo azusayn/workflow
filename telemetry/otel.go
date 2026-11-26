@@ -37,6 +37,7 @@ func (t *otelTracer) WithSpan(ctx context.Context, spanName string, fn func(ctx 
 	if err := fn(ctx, setAttribute); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	return nil

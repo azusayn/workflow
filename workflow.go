@@ -209,7 +209,7 @@ func (e *Engine) StartNodeExecutors(ctx context.Context) error {
 
 				execErr := run.execute(ctx, task.nodeID, &nodeStatus, &condition)
 				if execErr != nil {
-					logger.ErrorContext(task.ctx, "failed to execute node", slog.Any("err", err))
+					logger.ErrorContext(task.ctx, "failed to execute node", slog.Any("err", execErr))
 				}
 
 				if err = run.reconcileNodeStatus(ctx, task.nodeID, &nodeStatus, condition, execErr); err != nil {
