@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"encoding/json"
-	"errors"
 )
 
 var _ Store = (*noopStore)(nil)
@@ -50,8 +49,12 @@ func (s *noopStore) ListWorkflows(context.Context, []string) ([]*Workflow, error
 	return nil, nil
 }
 
-func (s *noopStore) GetWorkflowRun(context.Context, string) (*WorkflowRun, error) {
-	return nil, errors.New("unimplemented")
+func (s *noopStore) GetWorkflowRun(_ context.Context, workflowRunID string) (*WorkflowRun, error) {
+	return &WorkflowRun{
+		ID:             workflowRunID,
+		NodeExecutions: map[string]*NodeExecution{},
+		TraceCarrier:   map[string]string{},
+	}, nil
 }
 
 func (s *noopStore) ListPendingWorkflowRuns(context.Context) ([]*WorkflowRun, error) {

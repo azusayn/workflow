@@ -2,11 +2,14 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/azusayn/workflow/store"
 )
 
 func executionOf(run *workflowRun, nodeID string) (NodeStatus, error, bool) {
@@ -756,6 +759,160 @@ func TestEngineFailSkipsSuccessors(t *testing.T) {
 	}
 	if status, execErr, _ := executionOf(run, failSkipLeafID); status != NodeStatusSkipped || execErr != nil {
 		t.Fatalf("leaf status=%q err=%v, want skipped with nil err", status, execErr)
+	}
+}
+
+const (
+	retryFailNodeID = "retry_fail"
+	retryMidNodeID  = "retry_mid"
+	retryLeafNodeID = "retry_leaf"
+)
+
+type retryOnceFailNode struct {
+	attempts *atomic.Int32
+}
+
+func (n retryOnceFailNode) Execute(context.Context) error {
+	if n.attempts.Add(1) == 1 {
+		return errors.New("first attempt fails")
+	}
+	return nil
+}
+
+type retryOKNode struct{}
+
+func (retryOKNode) Execute(context.Context) error { return nil }
+
+func TestEngineRetryFailedNodeRestoresSuccessorsAndCompletes(t *testing.T) {
+	var attempts atomic.Int32
+	Register(retryFailNodeID, retryOnceFailNode{attempts: &attempts})
+	Register(retryMidNodeID, retryOKNode{})
+	Register(retryLeafNodeID, retryOKNode{})
+
+	configs := map[string]*NodeConfig{
+		RootNodeID:      {NextNodeIDs: []string{retryFailNodeID}},
+		retryFailNodeID: {NextNodeIDs: []string{retryMidNodeID}},
+		retryMidNodeID:  {NextNodeIDs: []string{retryLeafNodeID}},
+		retryLeafNodeID: {},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	engine, w := createTestWorkflow(t, ctx, "retry-fail", cloneNodeConfigs(configs), WithNodeExecutorNum(2))
+	startExecutors(t, ctx, engine)
+
+	runID, err := w.Run(ctx, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	run := activeRun(t, engine, runID)
+
+	waitUntilStatus(t, ctx, run, retryFailNodeID, NodeStatusFailed)
+	waitUntilStatus(t, ctx, run, retryMidNodeID, NodeStatusSkipped)
+	waitUntilStatus(t, ctx, run, retryLeafNodeID, NodeStatusSkipped)
+
+	if err := engine.RetryFailedNode(ctx, runID, retryMidNodeID); err == nil {
+		t.Fatal("RetryFailedNode on skipped successor must fail")
+	}
+	if err := engine.RetryFailedNode(ctx, runID, retryFailNodeID); err != nil {
+		t.Fatalf("RetryFailedNode: %v", err)
+	}
+	if status, execErr, _ := executionOf(run, retryMidNodeID); status != NodeStatusPending || execErr != nil {
+		t.Fatalf("mid after restore status=%q err=%v, want pending", status, execErr)
+	}
+	if status, execErr, _ := executionOf(run, retryLeafNodeID); status != NodeStatusPending || execErr != nil {
+		t.Fatalf("leaf after restore status=%q err=%v, want pending", status, execErr)
+	}
+
+	if status, execErr := waitTerminal(t, ctx, run, retryFailNodeID); status != NodeStatusCompleted || execErr != nil {
+		t.Fatalf("fail node after retry status=%q err=%v, want completed", status, execErr)
+	}
+	if status, execErr := waitTerminal(t, ctx, run, retryMidNodeID); status != NodeStatusCompleted || execErr != nil {
+		t.Fatalf("mid after retry status=%q err=%v, want completed", status, execErr)
+	}
+	if status, execErr := waitTerminal(t, ctx, run, retryLeafNodeID); status != NodeStatusCompleted || execErr != nil {
+		t.Fatalf("leaf after retry status=%q err=%v, want completed", status, execErr)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
+const (
+	retryLoadFailNodeID = "retry_load_fail"
+	retryLoadLeafNodeID = "retry_load_leaf"
+)
+
+type retryLoadStore struct {
+	store.Store
+	run      *store.WorkflowRun
+	workflow *store.Workflow
+}
+
+func (s *retryLoadStore) Transaction(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+func (s *retryLoadStore) GetWorkflowRun(context.Context, string) (*store.WorkflowRun, error) {
+	return s.run, nil
+}
+
+func (s *retryLoadStore) ListWorkflows(context.Context, []string) ([]*store.Workflow, error) {
+	return []*store.Workflow{s.workflow}, nil
+}
+
+func (s *retryLoadStore) UpdateWorkflowRun(context.Context, store.UpdateWorkflowRunInput) error {
+	return nil
+}
+
+func TestEngineRetryFailedNodeLoadsInactiveRun(t *testing.T) {
+	var attempts atomic.Int32
+	Register(retryLoadFailNodeID, retryOnceFailNode{attempts: &attempts})
+	Register(retryLoadLeafNodeID, retryOKNode{})
+	// The stored run already had its first failed attempt before it left activeRuns.
+	attempts.Store(1)
+
+	configs := map[string]*NodeConfig{
+		RootNodeID:          {NextNodeIDs: []string{retryLoadFailNodeID}},
+		retryLoadFailNodeID: {NextNodeIDs: []string{retryLoadLeafNodeID}},
+		retryLoadLeafNodeID: {},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	engine, w := createTestWorkflow(t, ctx, "retry-load", cloneNodeConfigs(configs), WithNodeExecutorNum(2))
+
+	// Simulate a run that is no longer in activeRuns: only the store knows about it.
+	engine.store = &retryLoadStore{
+		run: &store.WorkflowRun{
+			ID:         "retry-load-run",
+			WorkflowID: w.ID,
+			Data:       json.RawMessage("[]"),
+			NodeExecutions: map[string]*store.NodeExecution{
+				RootNodeID:          {Status: store.NodeStatusCompleted},
+				retryLoadFailNodeID: {Status: store.NodeStatusFailed, Err: errors.New("first attempt fails")},
+				retryLoadLeafNodeID: {Status: store.NodeStatusSkipped},
+			},
+		},
+		workflow: &store.Workflow{
+			ID:          w.ID,
+			NodeConfigs: convertToStoreNodeConfigs(w.NodeConfigs),
+		},
+	}
+	startExecutors(t, ctx, engine)
+
+	if err := engine.RetryFailedNode(ctx, "retry-load-run", retryLoadFailNodeID); err != nil {
+		t.Fatalf("RetryFailedNode: %v", err)
+	}
+	run := activeRun(t, engine, "retry-load-run")
+	if status, execErr := waitTerminal(t, ctx, run, retryLoadFailNodeID); status != NodeStatusCompleted || execErr != nil {
+		t.Fatalf("fail node after retry status=%q err=%v, want completed", status, execErr)
+	}
+	if status, execErr := waitTerminal(t, ctx, run, retryLoadLeafNodeID); status != NodeStatusCompleted || execErr != nil {
+		t.Fatalf("leaf after retry status=%q err=%v, want completed", status, execErr)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
 	}
 }
 
